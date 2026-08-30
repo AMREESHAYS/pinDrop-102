@@ -182,6 +182,12 @@ Read this before pointing a real bucket at the public internet.
 
 ---
 
+## License
+
+[MIT](LICENSE) — do what you like with it, just keep the copyright notice.
+
+---
+
 ## Tech
 
 React 18 · TypeScript · Vite 6 · Tailwind CSS 4 · Netlify Functions · Netlify Blobs · Cloudflare R2 (S3 API, signed with [aws4fetch](https://github.com/mhart/aws4fetch))

@@ -1,6 +1,8 @@
 {
-  "name": "sandbox-workspace",
+  "name": "pindrop",
+  "description": "Seal notes, links and files up to 50 GB behind a 6-digit PIN.",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
