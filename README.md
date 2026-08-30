@@ -1,10 +1,8 @@
 <div align="center">
 
-# [PinDrop](https://pindrop-102.netlify.app/)
+# PinDrop
 
 ### Seal anything behind six digits.
-
-### 🔗 [**pindrop-102.netlify.app**](https://pindrop-102.netlify.app/)
 
 Notes, links and files up to **50 GB** — drop them in, get a 6‑digit PIN.
 Anyone, anywhere types the digits and the drop opens. No accounts, no sign‑up, no waiting room.
