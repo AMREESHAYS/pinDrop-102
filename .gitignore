@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+*.log
+
+# build artefacts
+.deploy/
+.vault.test.mjs
+pinDrop-102.zip
+
+# local env
+.env
+.env.*
+.netlify/
