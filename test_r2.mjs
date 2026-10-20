@@ -186,16 +186,20 @@ test("neutralises filenames that would break the key URL", async () => {
   }
 });
 
-test("deletes a stored object", async () => {
+test("has no public delete — only the vault deletes, after checking the owner", async () => {
   const c = await (await call("create", { name: "gone.bin", size: 1024 })).json();
   objects.set(c.key, Buffer.from("bytes"));
-  const r = await call("delete", { key: c.key });
-  assert.equal(r.status, 200);
-  assert.equal((await call("delete", { key: "../nope" })).status, 400);
+  assert.equal((await call("delete", { key: c.key })).status, 404);
+  assert.ok(objects.has(c.key), "anonymous caller must not delete an object");
+
+  const { deleteR2Object } = await import("./netlify/functions/r2.mjs");
+  await deleteR2Object(c.key);
+  assert.ok(!objects.has(c.key));
+  await deleteR2Object("../nope"); // refused silently, no request made
 });
 
 test("rejects non-POST on the mutating actions", async () => {
-  for (const a of ["create", "sign", "complete", "abort", "delete"]) {
+  for (const a of ["create", "sign", "complete", "abort"]) {
     const r = await handler(new Request(`https://x/.netlify/functions/r2/${a}`));
     assert.equal(r.status, 405, `${a} should refuse GET`);
   }

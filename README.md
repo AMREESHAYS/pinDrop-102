@@ -38,14 +38,19 @@ The drop never travels with the PIN. The digits alone are the whole handover.
 
 | | |
 |---|---|
-| **6‑digit PINs** | Cryptographically random, checked for collisions before minting |
+| **6‑digit PINs** | Cryptographically random; the vault refuses a taken PIN outright |
 | **Any payload** | Notes up to 12 000 characters, links, or any number of files |
-| **50 GB files** | Uploaded in 8 MB parts straight to object storage |
-| **Resumable** | Close the tab mid‑upload and it picks up where it stopped |
-| **Self‑destruct** | Optional 1 h / 24 h / 7 d fuse, enforced on read |
-| **Burn after read** | The PIN dies the moment the first person opens it |
-| **Works offline‑ish** | A local shelf keeps your own drops instant on your device |
-| **No accounts** | Nothing to sign up for, nothing to log into |
+| **Receive mode** | Open an inbox PIN, someone sends into it, only you can read what arrives |
+| **QR on the receipt** | Scan with a phone and the PIN types itself |
+| **Password lock** | Optional; encrypted in the browser (PBKDF2 + AES‑GCM) — the vault holds only ciphertext |
+| **Installable** | Add to home screen, then share files straight from the phone's share sheet |
+| **Paste** | Paste a screenshot, file, link or text anywhere on the page |
+| **50 GB files** | With R2 configured: 8 MB parts straight to object storage, resumable |
+| **Self‑destruct** | Every drop has a fuse — 1 h / 24 h (default) / 7 d max |
+| **Open limits** | Burn after 1 open, or cap at 5 / 25 — counted by the server |
+| **Owner status** | Your shelf shows when a drop was opened, burned or filled |
+| **Guess lockout** | 20 wrong PINs per network per 10 minutes, then 429 |
+| **No accounts** | Nothing to sign up for; an owner token on your device proves a drop is yours |
 
 ---
 
@@ -62,7 +67,7 @@ Browser ──── PIN metadata ────►  Netlify Function  ───�
 
 Two moving pieces, deliberately separate:
 
-- **The vault** (`netlify/functions/vault.mjs`) stores only a small JSON record per PIN in Netlify Blobs — type, title, fuse, and the URLs of any files. Never the bytes. Fuses are enforced when the record is read, since blobs have no TTL of their own.
+- **The vault** (`netlify/functions/vault.mjs`) stores only a small JSON record per PIN in Netlify Blobs — type, title, fuse, and the URLs of any files. Never the bytes. It is also the whole security model: sealing is create‑only and returns an owner token (only its hash is stored); only that token can check on or shred a drop; opens, burn‑after‑read and open limits are counted in the same compare‑and‑swap that serves the drop; wrong guesses are budgeted per IP. Fuses are enforced on read, since blobs have no TTL of their own.
 - **The files** (`netlify/functions/r2.mjs`) go straight from the browser to object storage. The function hands out a presigned `PUT` for each 8 MB part and stitches them together at the end. **No credential ever reaches the browser**, and no file byte ever passes through the function.
 
 Because each part is its own request, a dropped connection costs one part rather than the whole transfer. Completed parts are recorded in `localStorage`, so re‑adding the same file resumes instead of restarting.
@@ -80,7 +85,7 @@ npm install
 npm run dev
 ```
 
-Open <http://localhost:3000>. Sealing works immediately; cloud publishing needs the functions, which run on a deploy (or under `netlify dev`).
+Open <http://localhost:3000>. For the cloud vault locally, run `npm run dev:functions` alongside — it serves both functions on the port Vite proxies to, backed by a local Blobs store in `.netlify/dev-blobs`.
 
 ### Scripts
 
@@ -88,6 +93,7 @@ Open <http://localhost:3000>. Sealing works immediately; cloud publishing needs 
 |---|---|
 | `npm run dev` | Vite dev server on port 3000 |
 | `npm run build` | Production build into `dist/` |
+| `npm run dev:functions` | Local functions + Blobs on port 9101 |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm test` | Full test suite |
 | `npm run pack` | Builds a drag‑and‑drop deploy bundle, `pinDrop-102.zip` |
@@ -167,7 +173,7 @@ curl https://your-site.netlify.app/.netlify/functions/r2/config
 npm test
 ```
 
-24 tests covering the PIN vault (storage, expiry, burn, validation), the drop model (file lists, legacy records, relay routing) and the multipart upload flow — a complete round trip against a stand‑in S3 server, plus key‑traversal rejection, size limits and part‑count caps.
+39 tests covering the vault's security rules (owner tokens, create‑only sealing, server‑side burn and open limits under concurrent readers, guess lockout, field whitelisting, fuse clamping, inboxes), the drop model, and the multipart upload flow — a complete round trip against a stand‑in S3 server, plus key‑traversal rejection, size limits and part‑count caps.
 
 ---
 
@@ -175,9 +181,11 @@ npm test
 
 Read this before pointing a real bucket at the public internet.
 
-- **The upload endpoint is unauthenticated by design.** "No accounts" is the premise of the app, which means anyone who finds the URL can push files into the bucket and you pay for the storage. There is a 50 GB per‑file ceiling and keys are server‑generated and unguessable, but there is **no rate limiting and no quota**.
+- **The upload endpoint is unauthenticated by design.** "No accounts" is the premise of the app, which means anyone who finds the URL can push files into the bucket and you pay for the storage. There is a 50 GB per‑file ceiling and keys are server‑generated and unguessable, but there is no quota — only a per‑IP request rate limit (Netlify's `config.rateLimit`).
 - **Add a lifecycle rule.** R2 → Settings → Object lifecycle: delete objects after 7–30 days and abort incomplete multipart uploads after a day. PinDrop deletes an object when the owner shreds a drop or its fuse expires, but a drop nobody ever touches again will sit there.
-- **A PIN is the only lock.** Six digits is a million combinations and the store is public — fine for a WiFi password, wrong for anything that actually matters. Don't drop state secrets.
+- **A PIN is the only lock, and nothing is encrypted.** Six digits is a million combinations. The guess lockout is per IP, so someone with many IPs can still sweep it — every drop expiring within 7 days is what keeps the odds down. Fine for a WiFi password, wrong for anything that actually matters.
+- **A password locks the drop record, not the file bytes.** Note text, links, titles and file names/URLs are encrypted in the browser; the vault stores ciphertext plus a hash of a proof derived from the password, and a wrong password costs a guess instead of an open. File contents on a relay or in R2 are not encrypted, so the storage host can read them. Lose the password and nobody can open the drop.
+- **Burn kills the PIN, not the bytes.** Whoever opens a burned drop still has its file URLs. R2 objects are deleted when the owner shreds a drop or its fuse expires on read; a lifecycle rule is the backstop for the rest.
 - **Free relays are third parties.** When object storage isn't configured, files go to tmpfiles or GoFile, whose retention and availability are entirely their call.
 
 ---

@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   buildOfflineLink,
   buildShareLink,
@@ -16,14 +16,16 @@ import {
   type DropType,
   type FileMeta,
 } from "../lib/vault";
-import { resumableBytes } from "../lib/r2";
-import { CopyButton } from "./ui";
-import { IconFile, IconFlame, IconLink, IconNote, IconUpload, IconX } from "./icons";
+import { PASSWORD_MIN } from "../lib/lock";
+import { r2Enabled, resumableBytes } from "../lib/r2";
+import { CopyButton, QrCode } from "./ui";
+import { IconDownload, IconFile, IconFlame, IconLink, IconNote, IconUpload, IconX } from "./icons";
 
 const TABS: { type: DropType; label: string; icon: (p: { width: number; height: number }) => ReactNode }[] = [
   { type: "note", label: "Note", icon: (p) => <IconNote {...p} /> },
   { type: "link", label: "Link", icon: (p) => <IconLink {...p} /> },
   { type: "file", label: "File", icon: (p) => <IconFile {...p} /> },
+  { type: "inbox", label: "Receive", icon: (p) => <IconDownload {...p} /> },
 ];
 
 const EXPIRY_OPTIONS = [
@@ -32,26 +34,56 @@ const EXPIRY_OPTIONS = [
   { label: "7D", ms: 7 * 864e5 },
 ];
 
+/** 1 is burn-after-read; null is no limit (the fuse still applies). */
+const OPEN_OPTIONS: { label: string; n: number | null }[] = [
+  { label: "1 · BURN", n: 1 },
+  { label: "5", n: 5 },
+  { label: "25", n: 25 },
+  { label: "∞", n: null },
+];
+
 type Phase = "idle" | "uploading" | "sealing";
 const NO_PROGRESS: BatchProgress = { done: 0, total: 0, name: "", sent: 0, bytes: 0 };
 
 interface Props {
   takenPins: Set<string>;
-  seal: (draft: Drop) => Promise<Drop | null>;
+  seal: (draft: Drop, password?: string) => Promise<Drop | null>;
   onError: (msg: string) => void;
   sealed: Drop | null;
   onDismissReceipt: () => void;
+  /** someone else's inbox PIN: what's sealed goes there instead of under a new PIN */
+  inboxTarget: { pin: string; title: string } | null;
+  onCancelInbox: () => void;
+  /** files/text handed over by the OS share sheet (PWA share target) */
+  shared: Incoming | null;
 }
 
-export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt }: Props) {
+export interface Incoming {
+  files: File[];
+  text: string;
+}
+
+export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt, inboxTarget, onCancelInbox, shared }: Props) {
   const [tab, setTab] = useState<DropType>("note");
   const [note, setNote] = useState("");
   const [link, setLink] = useState("");
   const [title, setTitle] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [dragging, setDragging] = useState(false);
-  const [expiry, setExpiry] = useState<number | null>(null);
-  const [burn, setBurn] = useState(false);
+  const [expiry, setExpiry] = useState(EXPIRY_OPTIONS[1].ms);
+  const [maxOpens, setMaxOpens] = useState<number | null>(null);
+  const [password, setPassword] = useState("");
+  const canLock = !inboxTarget && tab !== "inbox";
+  const usePassword = canLock && password.length > 0;
+  const passwordShort = usePassword && password.length < PASSWORD_MIN;
+  const burn = maxOpens === 1;
+  const [r2On, setR2On] = useState<boolean | null>(null);
+  useEffect(() => {
+    void r2Enabled().then(setR2On);
+  }, []);
+  useEffect(() => {
+    if (inboxTarget && tab === "inbox") setTab("note");
+  }, [inboxTarget, tab]);
   const [phase, setPhase] = useState<Phase>("idle");
   const [progress, setProgress] = useState<BatchProgress>(NO_PROGRESS);
   const fileInput = useRef<HTMLInputElement | null>(null);
@@ -87,6 +119,46 @@ export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt
     }
   };
 
+  /** Pasted or shared content: files go to the File tab, a lone URL to Link, other text to Note. */
+  const takeIn = (incoming: Incoming) => {
+    if (incoming.files.length) {
+      // Pasted screenshots all arrive as "image.png" — rename so they don't dedupe each other away.
+      addFiles(incoming.files.map((f, i) => (f.name === "image.png" ? new File([f], `pasted-${Date.now()}-${i}.png`, { type: f.type }) : f)));
+      setTab("file");
+      return;
+    }
+    const text = incoming.text.trim();
+    if (!text) return;
+    if (/^https?:\/\/\S+$/i.test(text)) {
+      setLink(text);
+      setTab("link");
+    } else {
+      setNote((n) => (n ? `${n}\n${text}` : text).slice(0, NOTE_MAX));
+      setTab("note");
+    }
+  };
+  const takeInRef = useRef(takeIn);
+  takeInRef.current = takeIn;
+
+  useEffect(() => {
+    if (shared) takeInRef.current(shared);
+  }, [shared]);
+
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      if (busy || !e.clipboardData) return;
+      const files = Array.from(e.clipboardData.files);
+      const t = e.target as HTMLElement | null;
+      const typing = !!t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+      // Text pasted into a field is the field's business; files are always ours.
+      if (!files.length && typing) return;
+      e.preventDefault();
+      takeInRef.current({ files, text: e.clipboardData.getData("text") });
+    };
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  }, [busy]);
+
   const removeFile = (i: number) => setFiles((prev) => prev.filter((_, n) => n !== i));
 
   const clearFiles = () => {
@@ -97,10 +169,12 @@ export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt
   const valid =
     (tab === "note" && note.trim().length > 0) ||
     (tab === "link" && link.trim().length > 0) ||
-    (tab === "file" && files.length > 0);
+    (tab === "file" && files.length > 0) ||
+    (tab === "inbox" && !inboxTarget);
+  const ready = valid && !passwordShort;
 
   const handleSeal = async () => {
-    if (!valid || busy) return;
+    if (!ready || busy) return;
     let pin = generatePin();
     let guard = 0;
     while (takenPins.has(pin) && guard++ < 8) pin = generatePin();
@@ -132,12 +206,15 @@ export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt
           ? "Sealed note"
           : tab === "link"
           ? "Shared link"
+          : tab === "inbox"
+          ? "Inbox"
           : relayed && relayed.length > 1
           ? `${relayed.length} files`
           : relayed?.[0]?.name || "Sealed file"),
       createdAt: Date.now(),
-      expiresAt: expiry ? Date.now() + expiry : undefined,
+      expiresAt: Date.now() + expiry,
       burnAfterRead: burn || undefined,
+      maxOpens: maxOpens && maxOpens > 1 ? maxOpens : undefined,
       opens: 0,
       payload: {
         text: tab === "note" ? note : undefined,
@@ -149,8 +226,9 @@ export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt
     // 2 — publish to the cloud vault + shelve locally
     setPhase("sealing");
     try {
-      const result = await seal(draft);
+      const result = await seal(draft, usePassword ? password : undefined);
       if (result) {
+        setPassword("");
         setNote("");
         setLink("");
         setTitle("");
@@ -170,9 +248,29 @@ export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt
     <div className="grid gap-6 lg:grid-cols-[1fr_400px]">
       {/* ------------ form ------------ */}
       <div className="min-w-0 rounded-xl border border-line bg-pine/70 p-4 sm:p-7">
+        {inboxTarget && (
+          <div className="mb-5 flex items-start justify-between gap-3 rounded-lg border border-mint/50 bg-mint/10 p-3.5">
+            <p className="font-mono text-[11px] leading-relaxed tracking-[0.1em] text-mint">
+              SENDING INTO INBOX ••{inboxTarget.pin.slice(-4)}
+              {inboxTarget.title ? ` · “${inboxTarget.title}”` : ""}
+              <br />
+              <span className="text-sage">WHAT YOU SEAL GOES TO ITS OWNER ONLY. ONE DELIVERY PER INBOX.</span>
+            </p>
+            <button
+              type="button"
+              onClick={onCancelInbox}
+              disabled={busy}
+              aria-label="Stop sending into this inbox"
+              className="shrink-0 rounded-md border border-line p-1.5 text-sage transition-colors hover:border-ember/60 hover:text-ember"
+            >
+              <IconX width={13} height={13} />
+            </button>
+          </div>
+        )}
+
         {/* tabs */}
-        <div className="flex w-full gap-1.5 rounded-lg border border-line bg-ink/60 p-1.5 sm:w-max">
-          {TABS.map((t) => (
+        <div className="flex w-full flex-wrap gap-1.5 rounded-lg border border-line bg-ink/60 p-1.5 sm:w-max">
+          {TABS.filter((t) => !(inboxTarget && t.type === "inbox")).map((t) => (
             <button
               key={t.type}
               type="button"
@@ -202,6 +300,13 @@ export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt
         </label>
 
         <div className="mt-4">
+          {tab === "inbox" && (
+            <p className="rounded-lg border border-dashed border-line bg-ink/40 p-4 text-sm leading-relaxed text-sage">
+              Need something from someone? Open an inbox and give them the PIN. They type it on any PinDrop,
+              seal a note, link or files, and it lands here — readable by you alone, not by anyone else who
+              learns the PIN. One delivery per inbox.
+            </p>
+          )}
           {tab === "note" && (
             <div>
               <textarea
@@ -304,7 +409,7 @@ export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt
                   {files.length ? "Add more files" : "Drop files here or click to browse"}
                 </span>
                 <span className="text-center font-mono text-[11px] text-fern">
-                  any type · pick as many as you like · up to {FILE_MAX_LABEL} each · relayed anonymously
+                  any type · pick, drop or paste as many as you like · up to {FILE_MAX_LABEL} each
                 </span>
               </button>
             </div>
@@ -318,26 +423,48 @@ export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt
           />
         </div>
 
-        {/* fuse + burn */}
-        <div className="mt-5 flex flex-wrap items-center gap-x-6 gap-y-4">
+        {canLock && (
+          <label className="mt-5 block">
+            <span className="font-mono text-[10px] font-bold tracking-[0.2em] text-fern">PASSWORD (OPTIONAL)</span>
+            <input
+              type="password"
+              autoComplete="new-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              disabled={busy}
+              aria-describedby="pw-hint"
+              aria-invalid={passwordShort || undefined}
+              placeholder="Encrypts the drop in this browser — send it separately from the PIN"
+              className="mt-1.5 w-full rounded-lg border border-line bg-ink/60 px-3.5 py-2.5 text-sm text-fog placeholder:text-fern/70 focus:border-gold/60 focus:outline-none"
+            />
+            <span id="pw-hint" className={`mt-1 block font-mono text-[10px] tracking-wider ${passwordShort ? "text-ember" : "text-fern"}`}>
+              {passwordShort
+                ? `AT LEAST ${PASSWORD_MIN} CHARACTERS`
+                : usePassword
+                ? "THE VAULT STORES ONLY CIPHERTEXT. LOSE THE PASSWORD AND NOBODY CAN OPEN IT — NOT EVEN YOU, FROM ANOTHER DEVICE."
+                : "WITHOUT ONE, THE PIN ALONE OPENS IT."}
+            </span>
+            {usePassword && tab === "file" && (
+              <span className="mt-1 block font-mono text-[10px] tracking-wider text-gold">
+                LOCKS THE FILE NAMES AND LINKS, NOT THE FILE BYTES — THE STORAGE HOST CAN STILL READ THOSE.
+              </span>
+            )}
+          </label>
+        )}
+
+        {/* fuse + open limit — an inbox's owner already chose these */}
+        {!inboxTarget && (
+        <>
+        <div className="mt-5 flex flex-wrap items-start gap-x-6 gap-y-4">
           <div>
             <p className="font-mono text-[10px] font-bold tracking-[0.2em] text-fern">SELF-DESTRUCT</p>
             <div className="mt-1.5 flex gap-1.5">
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => setExpiry(null)}
-                className={`rounded-md border px-3 py-1.5 font-mono text-[11px] font-bold tracking-wider transition-colors ${
-                  expiry === null ? "border-gold/70 bg-gold/15 text-brass" : "border-line text-sage hover:border-gold/40"
-                }`}
-              >
-                NEVER
-              </button>
               {EXPIRY_OPTIONS.map((o) => (
                 <button
                   key={o.label}
                   type="button"
                   disabled={busy}
+                  aria-pressed={expiry === o.ms}
                   onClick={() => setExpiry(o.ms)}
                   className={`rounded-md border px-3 py-1.5 font-mono text-[11px] font-bold tracking-wider transition-colors ${
                     expiry === o.ms ? "border-gold/70 bg-gold/15 text-brass" : "border-line text-sage hover:border-gold/40"
@@ -348,22 +475,43 @@ export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt
               ))}
             </div>
           </div>
-          <label className={`flex cursor-pointer select-none items-center gap-2.5 ${busy ? "opacity-50" : ""}`}>
-            <input type="checkbox" checked={burn} disabled={busy} onChange={(e) => setBurn(e.target.checked)} className="peer sr-only" />
-            <span className="relative h-6 w-11 shrink-0 rounded-full border border-line bg-ink/60 transition-colors peer-checked:border-ember/60 peer-checked:bg-ember/20">
-              <span className={`absolute left-0.5 top-0.5 h-[18px] w-[18px] rounded-full bg-sage transition-transform peer-checked:translate-x-0 ${burn ? "translate-x-5 bg-ember" : ""}`} />
-            </span>
-            <span className="flex items-center gap-1.5 font-mono text-[11px] font-bold tracking-wider text-sage">
-              <IconFlame width={13} height={13} /> BURN AFTER FIRST OPEN
-            </span>
-          </label>
+          <div>
+            <p className="flex items-center gap-1.5 font-mono text-[10px] font-bold tracking-[0.2em] text-fern">
+              <IconFlame width={12} height={12} /> OPENS ALLOWED
+            </p>
+            <div className="mt-1.5 flex gap-1.5">
+              {OPEN_OPTIONS.map((o) => (
+                <button
+                  key={o.label}
+                  type="button"
+                  disabled={busy}
+                  aria-pressed={maxOpens === o.n}
+                  onClick={() => setMaxOpens(o.n)}
+                  className={`rounded-md border px-3 py-1.5 font-mono text-[11px] font-bold tracking-wider transition-colors ${
+                    maxOpens === o.n
+                      ? o.n === 1
+                        ? "border-ember/70 bg-ember/15 text-ember"
+                        : "border-gold/70 bg-gold/15 text-brass"
+                      : "border-line text-sage hover:border-gold/40"
+                  }`}
+                >
+                  {o.label}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
+        <p className="mt-3 font-mono text-[10px] leading-relaxed tracking-[0.08em] text-fern">
+          EVERY DROP SELF-DESTRUCTS — 7 DAYS AT MOST. A PIN THAT LIVES FOREVER IS A PIN SOMEONE EVENTUALLY GUESSES.
+        </p>
+        </>
+        )}
 
         {tab === "file" && (
           <p className="mt-3 font-mono text-[10px] leading-relaxed tracking-[0.08em] text-fern">
-            UP TO 50 GB PER FILE. WITH PINDROP STORAGE CONFIGURED, UPLOADS GO IN 8 MB PARTS AND
-            RESUME WHERE THEY STOPPED — CLOSE THE TAB MID-FILE AND RE-ADD IT LATER. OTHERWISE FILES
-            FALL BACK TO THE FREE RELAYS (TMPFILES 48H / GOFILE ~10 DAYS), WHICH CANNOT RESUME.
+            {r2On
+              ? "UP TO 50 GB PER FILE, UPLOADED IN 8 MB PARTS THAT RESUME WHERE THEY STOPPED — CLOSE THE TAB MID-FILE AND RE-ADD IT LATER."
+              : "FILES GO TO FREE THIRD-PARTY RELAYS: TMPFILES (≤100 MB, KEPT 48H), LITTERBOX (≤1 GB, 72H), GOFILE (BIGGER, DOWNLOAD PAGE ONLY). NO RESUME, AND THE FUSE IS CUT TO THE RELAY'S LIFETIME. THE RELAYS CAN READ WHAT YOU UPLOAD."}
           </p>
         )}
 
@@ -406,13 +554,21 @@ export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt
         <button
           type="button"
           onClick={() => void handleSeal()}
-          disabled={!valid || busy}
+          disabled={!ready || busy}
           className="mt-6 w-full rounded-lg bg-gold py-3.5 font-display text-lg font-extrabold tracking-wide text-ink shadow-[0_10px_30px_-10px_rgba(233,180,76,0.55)] transition-all hover:-translate-y-0.5 hover:shadow-[0_14px_36px_-8px_rgba(233,180,76,0.7)] active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none disabled:hover:translate-y-0"
         >
           {busy
             ? phase === "uploading"
               ? `RELAYING ${Math.min(progress.done + 1, progress.total)}/${progress.total}${pct === null ? "" : ` · ${pct}%`}…`
               : "SEALING…"
+            : inboxTarget
+            ? `SEND INTO INBOX ••${inboxTarget.pin.slice(-4)}`
+            : tab === "inbox"
+            ? "OPEN AN INBOX · MINT MY PIN"
+            : usePassword
+            ? burn
+              ? "SEAL IT · LOCKED · BURN ON OPEN"
+              : "SEAL IT · PASSWORD-LOCKED"
             : burn
             ? "SEAL IT · BURN ON OPEN"
             : "SEAL IT · MINT MY PIN"}
@@ -444,9 +600,23 @@ export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt
                   <dd>{sealed.expiresAt ? new Date(sealed.expiresAt).toLocaleString() : "NONE"}</dd>
                 </div>
                 <div className="flex gap-2">
-                  <dt className="text-fern">BURN</dt>
-                  <dd>{sealed.burnAfterRead ? "AFTER FIRST OPEN" : "OFF"}</dd>
+                  <dt className="text-fern">OPENS</dt>
+                  <dd>
+                    {sealed.type === "inbox"
+                      ? "YOU ALONE, ONCE FILLED"
+                      : sealed.burnAfterRead
+                      ? "1 · BURNS ON OPEN"
+                      : sealed.maxOpens
+                      ? `${sealed.maxOpens} MAX`
+                      : "UNLIMITED UNTIL THE FUSE"}
+                  </dd>
                 </div>
+                {sealed.locked && (
+                  <div className="flex gap-2">
+                    <dt className="text-fern">LOCK</dt>
+                    <dd className="text-brass">PASSWORD · NOT STORED — SEND IT SEPARATELY</dd>
+                  </div>
+                )}
               </dl>
 
               <div className="my-5 border-t border-dashed border-line" />
@@ -469,6 +639,14 @@ export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt
                   <CopyButton text={sealed.pin} className="btn-solid" label="COPY PIN" />
                   <CopyButton text={shareLink} className="btn-ghost" label="COPY SHARE LINK" />
                 </div>
+                {sealed.remote && (
+                  <div className="flex items-center gap-4 rounded-lg border border-line bg-ink/40 p-3">
+                    <QrCode text={shareLink} size={112} />
+                    <p className="font-mono text-[10px] leading-relaxed tracking-[0.08em] text-sage">
+                      SCAN WITH A PHONE CAMERA — IT OPENS THIS PINDROP AND TYPES THE PIN FOR YOU.
+                    </p>
+                  </div>
+                )}
                 {offlineLink && (
                   <CopyButton
                     text={offlineLink}
@@ -479,7 +657,9 @@ export function SealStation({ takenPins, seal, onError, sealed, onDismissReceipt
               </div>
 
               <p className="mt-4 font-mono text-[10px] leading-relaxed tracking-[0.06em] text-fern">
-                {sealed.remote
+                {sealed.remote && sealed.type === "inbox"
+                  ? "GIVE THIS PIN (OR THE QR) TO WHOEVER IS SENDING YOU SOMETHING. KEEP THIS TAB OPEN OR COME BACK LATER — WHAT THEY SEND SHOWS UP IN YOUR VAULT."
+                  : sealed.remote
                   ? "SEND THE LINK — OR JUST THE DIGITS ONCE THEY'VE OPENED ANY PINDROP LINK. WORKS ON ANY DEVICE, ANY DISTANCE."
                   : "CLOUD VAULT UNREACHABLE — STORED ON THIS DEVICE ONLY. RETRY LATER TO PUBLISH IT."}
               </p>

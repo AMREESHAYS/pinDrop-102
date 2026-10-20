@@ -1,4 +1,5 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import qrcode from "qrcode-generator";
 import { IconCheck, IconCopy } from "./icons";
 
 /* ---------- scroll reveal ---------- */
@@ -157,5 +158,32 @@ export function ToastHost({ toasts, dismiss }: { toasts: Toast[]; dismiss: (id: 
         </button>
       ))}
     </div>
+  );
+}
+
+/** Scannable QR for a share link. Dark on light: phone cameras misread inverted codes. */
+export function QrCode({ text, size = 168 }: { text: string; size?: number }) {
+  const path = useMemo(() => {
+    const qr = qrcode(0, "M");
+    qr.addData(text);
+    qr.make();
+    const n = qr.getModuleCount();
+    let d = "";
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (qr.isDark(r, c)) d += `M${c + 4} ${r + 4}h1v1h-1z`;
+    return { d, view: n + 8 };
+  }, [text]);
+  return (
+    <svg
+      role="img"
+      aria-label="QR code for the share link"
+      viewBox={`0 0 ${path.view} ${path.view}`}
+      width={size}
+      height={size}
+      shapeRendering="crispEdges"
+      className="rounded-md"
+    >
+      <rect width="100%" height="100%" fill="#f4f1e8" />
+      <path d={path.d} fill="#0b120e" />
+    </svg>
   );
 }

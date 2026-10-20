@@ -32,6 +32,17 @@ function normalizeLink(l: string): string {
 
 type DlState = "idle" | "busy" | "done" | "handed";
 
+/** Inline preview for media the browser can show safely: <img>/<video>/<audio> never run scripts. */
+function Preview({ file }: { file: FileMeta }) {
+  if (!isDirectLink(file)) return null;
+  const mime = file.mime || "";
+  const cls = "mt-3 max-h-64 w-full rounded-md bg-ink object-contain";
+  if (mime.startsWith("image/")) return <img src={file.fileUrl} alt={file.name} loading="lazy" className={cls} />;
+  if (mime.startsWith("video/")) return <video src={file.fileUrl} controls preload="metadata" className={cls} />;
+  if (mime.startsWith("audio/")) return <audio src={file.fileUrl} controls preload="none" className="mt-3 w-full" />;
+  return null;
+}
+
 export function OpenedModal({ drop, burned, via, onClose }: Props) {
   const files = dropFiles(drop);
   const [dl, setDl] = useState<Record<string, DlState>>({});
@@ -125,6 +136,7 @@ export function OpenedModal({ drop, burned, via, onClose }: Props) {
               <p className="font-mono text-[10px] font-bold tracking-[0.24em] text-mint">
                 UNLOCKED · PIN {drop.pin}
                 {via === "cloud" && <span className="ml-2 rounded bg-gold/15 px-1.5 py-0.5 text-[9px] text-brass">FROM CLOUD</span>}
+                {via === "local" && <span className="ml-2 rounded bg-mint/15 px-1.5 py-0.5 text-[9px] text-mint">YOUR PREVIEW · NOT COUNTED</span>}
               </p>
               <h3 className="truncate font-display text-lg font-bold text-fog">{drop.title}</h3>
             </div>
@@ -161,10 +173,8 @@ export function OpenedModal({ drop, burned, via, onClose }: Props) {
               {files.map((f) => {
                 const state = dl[f.fileUrl] || "idle";
                 return (
-                  <li
-                    key={f.fileUrl}
-                    className="flex items-center gap-3.5 rounded-lg border border-line bg-ink/50 px-4 py-3.5"
-                  >
+                  <li key={f.fileUrl} className="rounded-lg border border-line bg-ink/50 px-4 py-3.5">
+                  <div className="flex items-center gap-3.5">
                     <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-gold/12 text-gold">
                       <IconFile width={20} height={20} />
                     </span>
@@ -184,6 +194,8 @@ export function OpenedModal({ drop, burned, via, onClose }: Props) {
                     >
                       {state === "done" ? <IconCheck width={15} height={15} /> : <IconDownload width={15} height={15} />}
                     </button>
+                  </div>
+                  <Preview file={f} />
                   </li>
                 );
               })}
@@ -241,7 +253,7 @@ export function OpenedModal({ drop, burned, via, onClose }: Props) {
           <div className="flex items-center gap-2.5 border-t border-ember/40 bg-ember/10 px-5 py-3">
             <IconFlame width={16} height={16} />
             <p className="font-mono text-[11px] font-semibold tracking-[0.14em] text-ember">
-              BURN COMPLETE — THIS DROP IS GONE FROM THE CLOUD VAULT.
+              THAT WAS THE LAST OPEN — THE PIN IS DEAD. SAVE EVERYTHING BEFORE YOU CLOSE THIS.
             </p>
           </div>
         )}

@@ -2,7 +2,7 @@
 // `npm test` writes first — this Node build has no TypeScript support.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import * as V from "./.vault.test.mjs";
+import * as V from "./.test-build/vault.js";
 const { dropFiles, totalBytes } = V;
 
 const mk = (payload) => ({ payload });

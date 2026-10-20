@@ -11,9 +11,11 @@
 /*          files, GoFile for big. The drop JSON only carries URLs.    */
 /* ------------------------------------------------------------------ */
 
-import { deleteFromR2, r2Enabled, uploadToR2 } from "./r2";
+import { deriveKeys, lockValue, unlockValue } from "./lock";
+import { r2Enabled, uploadToR2 } from "./r2";
 
-export type DropType = "note" | "link" | "file";
+/** "inbox" is a PIN sealed empty, waiting for someone else to send into it. */
+export type DropType = "note" | "link" | "file" | "inbox";
 
 export type RelayHost = "tmpfiles" | "litterbox" | "gofile" | "r2";
 
@@ -45,14 +47,24 @@ export interface Drop {
     /** legacy single-file records — read only, never written */
     file?: FileMeta;
   };
-  /** present when published to the cloud bucket */
+  /** stop serving after this many opens (burn-after-read is 1) */
+  maxOpens?: number;
+  /** present when published to the cloud vault */
   remote?: { bucket: string };
+  /** secret the vault minted at seal time — the only way to check on or shred the drop */
+  owner?: string;
+  /** sealed with a password: the vault holds only ciphertext */
+  locked?: boolean;
 }
 
 export type OpenVerdict =
   | { status: "ok"; drop: Drop; burned: boolean; via: "local" | "cloud" }
   | { status: "unknown" }
   | { status: "expired" }
+  | { status: "limited" }
+  | { status: "inbox"; title: string }
+  | { status: "filled" }
+  | { status: "locked" }
   | { status: "offline" };
 
 /** Files on a drop, old single-file records included. */
@@ -77,6 +89,7 @@ export const TYPE_LABEL: Record<DropType, string> = {
   note: "Note",
   link: "Link",
   file: "File",
+  inbox: "Inbox",
 };
 
 /* ----------------------------- utils ------------------------------ */
@@ -152,14 +165,6 @@ export const vaultSizeBytes = (drops: Drop[]): number =>
    nothing per-browser to remember. The bucket argument is kept so callers
    and existing #/r/<bucket>/<pin> share links keep working. */
 
-export const getOwnBucket = (): string => BUCKET;
-export const getKnownBuckets = (): string[] => [BUCKET];
-export function rememberBucket(_id: string) {
-  /* no-op — every browser reads the same store */
-}
-
-/* ----------------------------- cloud ------------------------------- */
-
 async function timedFetch(url: string, init?: RequestInit, ms = 10000): Promise<Response> {
   const c = new AbortController();
   const t = window.setTimeout(() => c.abort(), ms);
@@ -170,131 +175,199 @@ async function timedFetch(url: string, init?: RequestInit, ms = 10000): Promise<
   }
 }
 
-export async function ensureBucket(): Promise<string> {
-  return BUCKET;
-}
-
-export async function cloudPinTaken(_bucket: string, pin: string): Promise<boolean> {
-  try {
-    const res = await timedFetch(`${API}/${pin}`, undefined, 8000);
-    return res.ok;
-  } catch {
-    return false; // can't tell — treat as free rather than block sealing
-  }
-}
-
-/** Publish the drop under its PIN. Throws when the cloud is unreachable. */
-export async function publishDrop(_bucket: string, d: Drop): Promise<void> {
-  const body = JSON.stringify({
-    v: 1,
-    pin: d.pin,
-    type: d.type,
-    title: d.title,
-    createdAt: d.createdAt,
-    expiresAt: d.expiresAt,
-    burnAfterRead: d.burnAfterRead || undefined,
-    opens: d.opens,
-    text: d.payload.text,
-    link: d.payload.link,
-    files: dropFiles(d),
+/**
+ * Publish the drop under its PIN. The vault is create-only: a taken PIN throws
+ * "taken" so the caller can mint another. Returns the owner token and the fuse
+ * the vault actually set, which can be shorter than asked for.
+ */
+const dropBody = (d: Drop) =>
+  JSON.stringify({
+      type: d.type,
+      title: d.title,
+      expiresAt: d.expiresAt,
+      burnAfterRead: d.burnAfterRead || undefined,
+      maxOpens: d.maxOpens,
+      text: d.payload.text,
+      link: d.payload.link,
+      files: d.type === "file" ? dropFiles(d) : undefined,
   });
+
+const RELAY_TTL: Partial<Record<RelayHost, number>> = { tmpfiles: 48 * 36e5, litterbox: 72 * 36e5 };
+
+/**
+ * The vault can't see inside a locked drop, so the browser does what the vault
+ * would: cut the fuse to the relay lifetime and list the R2 keys to delete on shred.
+ */
+async function lockedBody(d: Drop, password: string): Promise<string> {
+  const files = d.type === "file" ? dropFiles(d) : [];
+  let expiresAt = d.expiresAt ?? Date.now() + 24 * 36e5;
+  for (const f of files) if (RELAY_TTL[f.host]) expiresAt = Math.min(expiresAt, Date.now() + RELAY_TTL[f.host]!);
+  const r2Keys = files
+    .filter((f) => f.host === "r2")
+    .map((f) => new URL(f.fileUrl, "https://x").searchParams.get("key"))
+    .filter((k): k is string => !!k);
+  return JSON.stringify({
+    type: d.type,
+    expiresAt,
+    burnAfterRead: d.burnAfterRead || undefined,
+    maxOpens: d.maxOpens,
+    locked: await lockValue({ title: d.title, text: d.payload.text, link: d.payload.link, files }, password),
+    r2Keys: r2Keys.length ? r2Keys : undefined,
+  });
+}
+
+export async function publishDrop(d: Drop, password?: string): Promise<{ owner: string; expiresAt: number }> {
   const res = await timedFetch(`${API}/${d.pin}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body,
+    body: password ? await lockedBody(d, password) : dropBody(d),
   });
-  if (!res.ok) throw new Error("publish");
+  if (res.status === 409) throw new Error("taken");
+  if (!res.ok) throw new Error(`publish-${res.status}`);
+  return (await res.json()) as { owner: string; expiresAt: number };
+}
+
+/** Send a drop into someone else's inbox PIN. It lands once; after that only they can open it. */
+export async function fillInbox(pin: string, d: Drop): Promise<void> {
+  const res = await timedFetch(`${API}/${pin}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: dropBody(d),
+  });
+  if (!res.ok) throw new Error(`fill-${res.status}`);
+}
+
+/** The owner reading what arrived in their inbox. */
+export async function openOwnInbox(drop: Drop): Promise<Drop | null> {
+  if (!drop.owner) return null;
+  try {
+    const res = await timedFetch(`${API}/${drop.pin}`, { headers: { "X-Owner-Token": drop.owner } }, 9000);
+    if (!res.ok) return null;
+    const raw = (await res.json()) as Record<string, unknown>;
+    return { ...recordToDrop(raw), id: drop.id, owner: drop.owner };
+  } catch {
+    return null;
+  }
 }
 
 /**
- * Shred a drop everywhere: the PIN record, and any bytes we actually own.
- * The free relays expire on their own; ours would sit there forever, and the
- * UI promises a burned drop is gone.
+ * Shred a drop everywhere. The vault deletes the record and any R2 bytes, but
+ * only for the holder of the owner token.
  */
 export async function destroyDrop(drop: Drop): Promise<void> {
-  await deleteRemote("", drop.pin);
-  await Promise.all(
-    dropFiles(drop)
-      .filter((f) => f.host === "r2")
-      .map((f) => deleteFromR2(f.fileUrl))
-  );
-}
-
-export async function deleteRemote(_bucket: string, pin: string): Promise<void> {
+  if (!drop.remote || !drop.owner) return;
   try {
-    await timedFetch(`${API}/${pin}`, { method: "DELETE" }, 8000);
+    await timedFetch(`${API}/${drop.pin}`, { method: "DELETE", headers: { "X-Owner-Token": drop.owner } }, 8000);
   } catch {
-    /* best effort */
+    /* best effort — the fuse is the backstop */
   }
 }
 
-async function bumpOpens(raw: Record<string, unknown>) {
+export type OwnerStatus = { opens: number; expiresAt: number; filled?: boolean } | "gone" | "offline";
+
+/** Owner-only check: how often it's been opened, or whether it's gone. Never counts an open. */
+export async function fetchOwnerStatus(drop: Drop): Promise<OwnerStatus> {
+  if (!drop.owner) return "offline";
   try {
-    const next: Record<string, unknown> = { ...raw, opens: (Number(raw.opens) || 0) + 1 };
-    await timedFetch(`${API}/${String(next.pin)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(next),
-    }, 8000);
+    const res = await timedFetch(`${API}/${drop.pin}/status`, { headers: { "X-Owner-Token": drop.owner } }, 8000);
+    if (res.status === 404 || res.status === 403) return "gone";
+    if (!res.ok) return "offline";
+    return (await res.json()) as { opens: number; expiresAt: number; filled?: boolean };
   } catch {
-    /* cosmetic */
+    return "offline";
   }
 }
 
-interface CloudRecord {
-  raw: Record<string, unknown>;
-  drop: Drop;
-  bucket: string;
-}
+const RELAYS: RelayHost[] = ["tmpfiles", "litterbox", "gofile", "r2"];
 
-function recordToDrop(bucket: string, raw: Record<string, unknown>): Drop {
+/** Same rule the vault applies to unlocked drops; locked ones only get checked here, after decrypting. */
+const safeFile = (f: FileMeta): boolean =>
+  !!f &&
+  typeof f.fileUrl === "string" &&
+  RELAYS.includes(f.host) &&
+  (f.host === "r2" ? f.fileUrl.startsWith("/.netlify/functions/r2/get?key=") : f.fileUrl.startsWith("https://"));
+
+function recordToDrop(raw: Record<string, unknown>): Drop {
   const list = Array.isArray(raw.files) ? (raw.files as FileMeta[]) : [];
   const legacy = raw.file as FileMeta | undefined;
-  const files = (list.length ? list : legacy ? [legacy] : []).filter((f) => f && f.fileUrl);
+  const files = (list.length ? list : legacy ? [legacy] : []).filter(safeFile);
   return {
-    id: `r-${bucket}-${String(raw.pin)}`,
+    id: `r-${String(raw.pin)}`,
     pin: String(raw.pin),
     type: (raw.type as DropType) || "note",
     title: String(raw.title || "Untitled drop"),
     createdAt: Number(raw.createdAt) || Date.now(),
     expiresAt: typeof raw.expiresAt === "number" ? raw.expiresAt : undefined,
     burnAfterRead: !!raw.burnAfterRead,
+    maxOpens: typeof raw.maxOpens === "number" ? raw.maxOpens : undefined,
     opens: Number(raw.opens) || 0,
     payload: {
       text: typeof raw.text === "string" ? raw.text : undefined,
       link: typeof raw.link === "string" ? raw.link : undefined,
       files: files.length ? files : undefined,
     },
-    remote: { bucket },
+    remote: { bucket: BUCKET },
   };
 }
 
 /**
- * Look the PIN up in the global store.
- * Returns the drop, "none" (404/410/garbage), or "offline" (network failed).
+ * Open a PIN in the global vault. The vault counts the open, and burns the
+ * drop when this was its last allowed open — `burned` says so.
  */
+export type OpenResult = Awaited<ReturnType<typeof fetchDropByPin>>;
+
 export async function fetchDropByPin(
   pin: string,
-  _buckets?: string[]
-): Promise<CloudRecord | "none" | "offline"> {
+  auth?: string
+): Promise<
+  | { drop: Drop; burned: boolean; box?: string }
+  | { inbox: { pin: string; title: string } }
+  | { needsPassword: { salt: string; wrong: boolean } }
+  | "none"
+  | "expired"
+  | "limited"
+  | "filled"
+  | "offline"
+> {
   try {
-    const res = await timedFetch(`${API}/${pin}`, undefined, 9000);
+    const res = await timedFetch(`${API}/${pin}`, auth ? { headers: { "X-Drop-Auth": auth } } : undefined, 9000);
+    if (res.status === 429) return "limited";
+    if (res.status === 401) {
+      const j = (await res.json()) as { salt?: string; error?: string };
+      if (!j.salt || !/^[0-9a-f]{32}$/.test(j.salt)) return "none";
+      return { needsPassword: { salt: j.salt, wrong: j.error === "wrong-password" } };
+    }
+    if (res.status === 410) return "expired";
+    if (res.status === 409) return "filled";
     if (!res.ok) return "none";
     const raw = JSON.parse(await res.text()) as Record<string, unknown>;
     if (!raw || raw.pin !== pin) return "none";
-    return { raw, drop: recordToDrop(BUCKET, raw), bucket: BUCKET };
+    if (raw.type === "inbox" && raw.waiting) return { inbox: { pin, title: String(raw.title || "") } };
+    const box = (raw.locked as { box?: unknown } | undefined)?.box;
+    return { drop: recordToDrop(raw), burned: raw.burned === true, box: typeof box === "string" ? box : undefined };
   } catch (e) {
     // JSON.parse failure means a real but corrupt record — not a network problem.
     return e instanceof SyntaxError ? "none" : "offline";
   }
 }
 
-export async function registerCloudOpen(rec: CloudRecord, burn: boolean): Promise<void> {
-  if (burn) {
-    await deleteRemote(rec.bucket, rec.drop.pin);
-  } else {
-    await bumpOpens(rec.raw);
+/**
+ * Open a password-locked PIN: derive the proof, let the vault check it (a wrong
+ * one costs a guess, never an open), then decrypt what it hands back.
+ */
+export async function unlockDrop(pin: string, salt: string, password: string): Promise<OpenResult | "corrupt"> {
+  const { key, auth } = await deriveKeys(password, salt);
+  const res = await fetchDropByPin(pin, auth);
+  if (typeof res !== "object" || !("drop" in res) || !res.box) return res;
+  let inner: Record<string, unknown>;
+  try {
+    inner = (await unlockValue(res.box, key)) as Record<string, unknown>;
+  } catch {
+    return "corrupt"; // right proof, undecryptable box: tampered or broken record
   }
+  const opened = recordToDrop({ ...inner, pin, type: res.drop.type, createdAt: res.drop.createdAt,
+    expiresAt: res.drop.expiresAt, burnAfterRead: res.drop.burnAfterRead, maxOpens: res.drop.maxOpens, opens: res.drop.opens });
+  return { drop: { ...opened, locked: true }, burned: res.burned };
 }
 
 /* --------------------------- file relays --------------------------- */
@@ -465,7 +538,8 @@ function b64decode(s: string): string {
 
 /** Self-contained link payload — the drop travels inside the URL itself. */
 export function encodeSelfContained(d: Drop): string | null {
-  if (d.type === "file") return null;
+  // A URL that carries the content can't be burned, limited or expired.
+  if (d.type === "file" || d.burnAfterRead || d.maxOpens || d.expiresAt) return null;
   try {
     const json = JSON.stringify({
       s: 1,
@@ -506,7 +580,7 @@ export function decodeSelfContained(payload: string): Drop | null {
 const base = () => window.location.origin + window.location.pathname;
 
 export function buildShareLink(d: Drop): string {
-  if (d.remote) return `${base()}#/r/${d.remote.bucket}/${d.pin}`;
+  if (d.remote) return `${base()}#/d/${d.pin}`;
   const sc = encodeSelfContained(d);
   if (sc) return `${base()}#/s/${sc}`;
   return `${base()}#/d/${d.pin}`;
@@ -519,15 +593,15 @@ export function buildOfflineLink(d: Drop): string | null {
 
 export type HashRoute =
   | { kind: "autotype"; pin: string }
-  | { kind: "remote"; bucket: string; pin: string }
   | { kind: "selfcontained"; drop: Drop };
 
 export function parseHash(hash: string): HashRoute | null {
   const h = hash.replace(/^#\/?/, "");
   if (!h) return null;
   const parts = h.split("/");
-  if (parts[0] === "r" && parts[1] && parts[2] && /^\d{6}$/.test(parts[2])) {
-    return { kind: "remote", bucket: parts[1].replace(/[^A-Za-z0-9-]/g, ""), pin: parts[2] };
+  // old share links: #/r/<bucket>/<pin>
+  if (parts[0] === "r" && parts[2] && /^\d{6}$/.test(parts[2])) {
+    return { kind: "autotype", pin: parts[2] };
   }
   if (parts[0] === "s" && parts[1]) {
     const drop = decodeSelfContained(parts[1]);

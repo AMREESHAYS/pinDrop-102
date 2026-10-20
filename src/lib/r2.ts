@@ -136,20 +136,6 @@ function putPart(
  * Returns the download URL. Throws if the upload cannot be completed.
  */
 /** Delete the stored object behind an r2 file URL. Best effort. */
-export async function deleteFromR2(fileUrl: string): Promise<void> {
-  const key = new URL(fileUrl, location.origin).searchParams.get("key");
-  if (!key) return;
-  try {
-    await fetch(`${API}/delete`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ key }),
-    });
-  } catch {
-    /* best effort — a lifecycle rule is the backstop */
-  }
-}
-
 export async function uploadToR2(
   file: File,
   onProgress?: UploadProgress,

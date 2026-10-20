@@ -5,25 +5,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="color-scheme" content="dark" />
     <meta name="theme-color" content="#0b120e" />
-    <meta name="description" content="PinDrop — seal notes, links and whole batches of files (up to 50 GB each) behind a 6-digit PIN. Anyone, anywhere can type the digits and open the drop. No accounts, loads instantly." />
+    <meta name="description" content="PinDrop — seal notes, links and batches of files behind a 6-digit PIN. Anyone, anywhere can type the digits and open the drop. Self-destructing, burn-after-read, no accounts." />
     <title>PinDrop — Seal anything behind a 6-digit PIN</title>
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='4' y='13' width='24' height='16' rx='4' fill='%23E9B44C'/%3E%3Cpath d='M10 13V9a6 6 0 0 1 12 0v4' fill='none' stroke='%23E9B44C' stroke-width='3'/%3E%3Ccircle cx='16' cy='21' r='3' fill='%230B120E'/%3E%3C/svg%3E" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <!-- Only the weights actually used, loaded off the critical path: the page
-         paints immediately in the fallback stack and swaps when the fonts land. -->
+    <!-- display=swap: the page paints in the fallback stack and swaps when the fonts land.
+         A plain stylesheet, because the CSP forbids the inline onload trick. -->
     <link
       rel="stylesheet"
       href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=IBM+Plex+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@400;600&display=swap"
-      media="print"
-      onload="this.media='all'"
     />
-    <noscript>
-      <link
-        rel="stylesheet"
-        href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=IBM+Plex+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@400;600&display=swap"
-      />
-    </noscript>
   </head>
   <body>
     <div id="root"></div>

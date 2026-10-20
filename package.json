@@ -8,32 +8,21 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "test": "esbuild src/lib/vault.ts --bundle --format=esm --outfile=.vault.test.mjs --log-level=warning && node --test --experimental-test-module-mocks test_vault.mjs test_model.mjs test_r2.mjs",
-    "pack": "./pack.sh"
+    "test": "esbuild src/lib/vault.ts src/lib/lock.ts --bundle --format=esm --outdir=.test-build --log-level=warning && node --test --experimental-test-module-mocks test_vault.mjs test_model.mjs test_r2.mjs test_lock.mjs",
+    "pack": "./pack.sh",
+    "dev:functions": "node dev-functions.mjs"
   },
   "dependencies": {
-    "@dnd-kit/core": "^6.1.0",
-    "@dnd-kit/sortable": "^8.0.0",
-    "@dnd-kit/utilities": "^3.2.2",
-    "@netlify/blobs": "^8.1.0",
-    "@supabase/supabase-js": "^2.98.0",
+    "@netlify/blobs": "^11.1.4",
     "aws4fetch": "^1.0.20",
-    "canvas-confetti": "^1.9.3",
-    "date-fns": "^2.30.0",
-    "framer-motion": "^11.16.1",
-    "lucide-react": "^0.294.0",
+    "qrcode-generator": "^2.0.4",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "react-router-dom": "^6.8.0",
-    "recharts": "^2.10.0",
-    "uuid": "^9.0.1"
+    "react-dom": "^18.2.0"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.7",
-    "@types/canvas-confetti": "^1.6.4",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
-    "@types/uuid": "^9.0.7",
     "@vitejs/plugin-react": "^4.3.4",
     "tailwindcss": "^4.1.7",
     "typescript": "^5.7.0",

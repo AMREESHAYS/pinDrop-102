@@ -1,19 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  cloudPinTaken,
-  deleteRemote,
   destroyDrop,
-  ensureBucket,
   fetchDropByPin,
+  fetchOwnerStatus,
+  fillInbox,
   generatePin,
-  getKnownBuckets,
   isExpired,
   loadVault,
+  openOwnInbox,
   parseHash,
   publishDrop,
-  rememberBucket,
-  registerCloudOpen,
   saveVault,
+  unlockDrop,
   timeAgo,
   TYPE_LABEL,
   vaultSizeBytes,
@@ -21,9 +19,10 @@ import {
   type OpenVerdict,
 } from "./lib/vault";
 import { Keypad } from "./components/Keypad";
-import { SealStation } from "./components/SealStation";
+import { SealStation, type Incoming } from "./components/SealStation";
 import { VaultList } from "./components/VaultList";
 import { OpenedModal } from "./components/OpenedModal";
+import { UnlockModal } from "./components/UnlockModal";
 import { CountUp, Reveal, ToastHost, type Toast, type ToastKind } from "./components/ui";
 import {
   IconCloud,
@@ -60,6 +59,24 @@ function useInView<T extends HTMLElement>() {
   return { ref, inView };
 }
 
+/** Collect what sw.js stashed from the OS share sheet, once, then clear it. */
+async function takeShared(): Promise<Incoming | null> {
+  if (!("caches" in window)) return null;
+  const cache = await caches.open("pindrop-share");
+  const meta = await cache.match("/shared/meta");
+  if (!meta) return null;
+  const { text, count } = (await meta.json()) as { text: string; count: number };
+  const files: File[] = [];
+  for (let i = 0; i < count; i++) {
+    const r = await cache.match(`/shared/file/${i}`);
+    if (!r) continue;
+    const name = decodeURIComponent(r.headers.get("X-Name") || `shared-${i}`);
+    files.push(new File([await r.blob()], name, { type: r.headers.get("Content-Type") || "" }));
+  }
+  await caches.delete("pindrop-share");
+  return { files, text: text || "" };
+}
+
 const DRIFT_DIGITS = [
   { ch: "4", left: "6%", top: "18%", delay: "0s", dur: "13s", cls: "text-gold/12" },
   { ch: "0", left: "14%", top: "72%", delay: "1.2s", dur: "16s", cls: "text-mint/10" },
@@ -79,6 +96,22 @@ export default function App() {
   const [opened, setOpened] = useState<{ drop: Drop; burned: boolean; via?: "local" | "cloud" } | null>(null);
   const [autoPin, setAutoPin] = useState<string | null>(null);
   const [autoNonce, setAutoNonce] = useState(0);
+  /** someone else's inbox PIN we're about to send into */
+  const [inboxTarget, setInboxTarget] = useState<{ pin: string; title: string } | null>(null);
+  /** a password-locked PIN waiting for its password */
+  const [locked, setLocked] = useState<{ pin: string; salt: string } | null>(null);
+  const [shared, setShared] = useState<Incoming | null>(null);
+
+  /* ------- arrived via the OS share sheet (installed app) ------- */
+  useEffect(() => {
+    if (window.location.hash !== "#/share") return;
+    history.replaceState(null, "", window.location.pathname);
+    void takeShared().then((got) => {
+      if (!got) return;
+      setShared(got);
+      document.getElementById("seal")?.scrollIntoView({ behavior: "smooth" });
+    });
+  }, []);
 
   const dropsRef = useRef(drops);
   useEffect(() => {
@@ -103,7 +136,7 @@ export default function App() {
     [toast]
   );
 
-  /* ------- share-link routing: #/r/bucket/pin · #/s/payload · #/d/pin ------- */
+  /* ------- share-link routing: #/d/pin · #/s/payload ------- */
   useEffect(() => {
     const handle = () => {
       const route = parseHash(window.location.hash);
@@ -112,7 +145,6 @@ export default function App() {
         setOpened({ drop: route.drop, burned: false });
         return;
       }
-      if (route.kind === "remote") rememberBucket(route.bucket);
       setAutoPin(route.pin);
       setAutoNonce((n) => n + 1);
       document.getElementById("terminal")?.scrollIntoView({ behavior: "smooth" });
@@ -124,31 +156,63 @@ export default function App() {
 
   /* ------- seal: publish to cloud vault + shelve locally ------- */
   const handleSeal = useCallback(
-    async (draft: Drop): Promise<Drop | null> => {
+    async (draft: Drop, password?: string): Promise<Drop | null> => {
+      if (inboxTarget) {
+        try {
+          await fillInbox(inboxTarget.pin, draft);
+        } catch (e) {
+          const why = String(e);
+          toast(
+            "error",
+            why.includes("409")
+              ? "That inbox already got its delivery — ask for a new PIN."
+              : why.includes("410")
+              ? "That inbox expired before you sent."
+              : why.includes("429")
+              ? "Too many attempts from this network — try again in a few minutes."
+              : "Couldn't deliver — the cloud vault is unreachable."
+          );
+          return null;
+        }
+        toast("success", `Delivered to inbox ••${inboxTarget.pin.slice(-4)}. Only its owner can open it now.`);
+        setInboxTarget(null);
+        return draft;
+      }
       let drop = draft;
       try {
-        const bucket = await ensureBucket();
-        let pin = draft.pin;
-        let guard = 0;
-        while ((dropsRef.current.some((d) => d.pin === pin) || (await cloudPinTaken(bucket, pin))) && guard++ < 6) {
-          pin = generatePin();
+        // The vault refuses a taken PIN outright; mint another and retry.
+        for (let tries = 0; ; tries++) {
+          if (dropsRef.current.some((d) => d.pin === drop.pin)) {
+            drop = { ...drop, pin: generatePin() };
+            continue;
+          }
+          try {
+            const { owner, expiresAt } = await publishDrop(drop, password);
+            drop = { ...drop, owner, expiresAt, locked: !!password || undefined, remote: { bucket: "global" } };
+            break;
+          } catch (e) {
+            if (String(e).includes("taken") && tries < 5) drop = { ...drop, pin: generatePin() };
+            else throw e;
+          }
         }
-        drop = { ...draft, pin, remote: { bucket } };
-        await publishDrop(bucket, drop);
-        rememberBucket(bucket);
-      } catch {
-        toast("error", "Cloud vault unreachable — sealed on this device only. Reseal later to publish.");
-        drop = { ...drop, remote: undefined };
+      } catch (e) {
+        toast(
+          "error",
+          String(e).includes("429")
+            ? "Too many attempts from this network — sealed on this device only. Try again in a few minutes."
+            : "Cloud vault unreachable — sealed on this device only. Reseal later to publish."
+        );
+        drop = { ...drop, remote: undefined, owner: undefined };
       }
       if (!persist([drop, ...dropsRef.current])) return null;
       setSealed(drop);
       if (drop.remote) toast("success", `Sealed & published. PIN ${drop.pin} now works on any device.`);
       return drop;
     },
-    [persist, toast]
+    [inboxTarget, persist, toast]
   );
 
-  /* ------- open: local shelf first, then every known cloud bucket ------- */
+  /* ------- open: local shelf first (owner preview), then the cloud vault ------- */
   const attemptOpen = useCallback(
     async (pin: string): Promise<OpenVerdict> => {
       const drops = dropsRef.current;
@@ -160,32 +224,58 @@ export default function App() {
           toast("info", "That drop expired and was shredded.");
           return { status: "expired" };
         }
-        const burned = !!local.burnAfterRead;
-        const openedDrop: Drop = { ...local, opens: local.opens + 1 };
-        persist(burned ? drops.filter((d) => d.id !== local.id) : drops.map((d) => (d.id === local.id ? openedDrop : d)));
-        // Burn kills the PIN, not the bytes — the person opening it right now
-        // still has to download them. The object goes when the owner shreds
-        // the drop or its fuse runs out.
-        if (burned && local.remote) void deleteRemote(local.remote.bucket, pin);
-        setOpened({ drop: openedDrop, burned, via: "local" });
-        return { status: "ok", drop: openedDrop, burned, via: "local" };
+        if (local.type === "inbox") {
+          toast("info", "That's your own inbox — still waiting for someone to send into it.");
+          return { status: "inbox", title: local.title };
+        }
+        // Your own drop on your own device is a preview: it neither counts
+        // as an open nor burns the PIN for the person you sent it to.
+        setOpened({ drop: local, burned: false, via: "local" });
+        return { status: "ok", drop: local, burned: false, via: "local" };
       }
-      const res = await fetchDropByPin(pin, getKnownBuckets());
+      const res = await fetchDropByPin(pin);
       if (res === "offline") return { status: "offline" };
       if (res === "none") return { status: "unknown" };
-      if (isExpired(res.drop)) {
-        void destroyDrop(res.drop);
+      if (res === "limited") return { status: "limited" };
+      if (res === "filled") return { status: "filled" };
+      if (res === "expired") {
         toast("info", "That drop expired and was shredded from the cloud vault.");
         return { status: "expired" };
       }
-      const burned = !!res.drop.burnAfterRead;
-      await registerCloudOpen(res, burned);
-      rememberBucket(res.bucket);
-      const openedDrop: Drop = { ...res.drop, opens: res.drop.opens + 1 };
-      setOpened({ drop: openedDrop, burned, via: "cloud" });
-      return { status: "ok", drop: openedDrop, burned, via: "cloud" };
+      if ("needsPassword" in res) {
+        setLocked({ pin, salt: res.needsPassword.salt });
+        return { status: "locked" };
+      }
+      if ("inbox" in res) {
+        setInboxTarget(res.inbox);
+        toast("info", `PIN ••${pin.slice(-4)} is an inbox — whatever you seal next goes straight to its owner.`);
+        document.getElementById("seal")?.scrollIntoView({ behavior: "smooth" });
+        return { status: "inbox", title: res.inbox.title };
+      }
+      setOpened({ drop: res.drop, burned: res.burned, via: "cloud" });
+      return { status: "ok", drop: res.drop, burned: res.burned, via: "cloud" };
     },
     [persist, toast]
+  );
+
+  const handleUnlock = useCallback(
+    async (password: string): Promise<string | null> => {
+      if (!locked) return null;
+      const res = await unlockDrop(locked.pin, locked.salt, password);
+      if (typeof res === "object" && "drop" in res) {
+        setLocked(null);
+        setOpened({ drop: res.drop, burned: res.burned, via: "cloud" });
+        return null;
+      }
+      if (typeof res === "object" && "needsPassword" in res) return "Wrong password — that counted as a wrong guess.";
+      if (res === "limited") return "Too many wrong tries from this network — wait 10 minutes.";
+      if (res === "offline") return "Can't reach the cloud vault — check your connection.";
+      if (res === "corrupt") return "The password was right but the drop is damaged — it can't be decrypted.";
+      setLocked(null);
+      toast("info", "That drop is gone — burned, expired or shredded.");
+      return null;
+    },
+    [locked, toast]
   );
 
   const handleDelete = useCallback(
@@ -198,6 +288,53 @@ export default function App() {
     },
     [persist, sealed, toast]
   );
+
+  /* ------- owner status: who opened what, what arrived, which drops are gone ------- */
+  useEffect(() => {
+    let running = false;
+    const check = async () => {
+      if (running) return;
+      running = true;
+      try {
+        const mine = dropsRef.current.filter((d) => d.remote && d.owner && !isExpired(d));
+        if (mine.length === 0) return;
+        const results = await Promise.all(mine.map(async (d) => [d, await fetchOwnerStatus(d)] as const));
+        let next = dropsRef.current;
+        for (const [d, st] of results) {
+          if (st === "offline") continue;
+          if (st === "gone") {
+            next = next.filter((x) => x.id !== d.id);
+            toast("info", `Drop ••${d.pin.slice(-4)} is gone from the cloud vault — burned, limit reached or expired.`);
+          } else if (d.type === "inbox") {
+            if (!st.filled) continue;
+            const arrived = await openOwnInbox(d);
+            if (!arrived) continue;
+            next = next.map((x) => (x.id === d.id ? arrived : x));
+            toast("success", `Something arrived in your inbox ••${d.pin.slice(-4)} — open it from your vault.`);
+          } else if (st.opens !== d.opens) {
+            next = next.map((x) => (x.id === d.id ? { ...x, opens: st.opens, expiresAt: st.expiresAt } : x));
+            toast("success", `Drop ••${d.pin.slice(-4)} was opened (${st.opens}×).`);
+          }
+        }
+        if (next !== dropsRef.current) persist(next);
+      } finally {
+        running = false;
+      }
+    };
+    void check();
+    // Each check costs the vault a request per drop: re-check when the tab comes
+    // back, and poll only while an inbox of ours is open and waiting.
+    const onVisible = () => document.visibilityState === "visible" && void check();
+    document.addEventListener("visibilitychange", onVisible);
+    const timer = window.setInterval(() => {
+      const waiting = dropsRef.current.some((d) => d.type === "inbox" && d.owner && !isExpired(d));
+      if (waiting && document.visibilityState === "visible") void check();
+    }, 10_000);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.clearInterval(timer);
+    };
+  }, [persist, toast]);
 
   const ownerOpen = useCallback(
     (drop: Drop) => {
@@ -264,7 +401,8 @@ export default function App() {
         {/* ================= terminal ================= */}
         <section id="terminal" className="mx-auto max-w-6xl scroll-mt-20 px-4 pb-16 pt-10 sm:px-6 sm:pt-16">
           <div className="grid items-start gap-10 lg:grid-cols-[1.08fr_0.92fr] lg:gap-12">
-            <div>
+            {/* min-w-0: the w-max ticker would otherwise stretch this column and push the keypad off-screen */}
+            <div className="min-w-0">
               <Reveal>
                 <p className="flex items-center gap-2.5 font-mono text-[11px] font-semibold tracking-[0.28em] text-gold">
                   <IconTerminal width={15} height={15} />
@@ -278,10 +416,9 @@ export default function App() {
               </Reveal>
               <Reveal delay={120}>
                 <p className="mt-5 max-w-[54ch] text-base leading-relaxed text-sage sm:text-lg">
-                  Notes, links, and as many files as you like (up to{" "}
-                  <strong className="font-semibold text-fog">50 GB</strong> each) — drop them in and get a <strong className="font-semibold text-fog">6-digit PIN</strong>. Your drop
-                  is published to a public cloud vault keyed by that PIN, so anyone, anywhere can punch the digits into
-                  this terminal and the drop pops open. No share link needed — the digits alone are enough.
+                  Notes, links, and batches of files — drop them in and get a <strong className="font-semibold text-fog">6-digit PIN</strong>. Anyone,
+                  anywhere can punch the digits into this terminal and the drop pops open. Every drop self-destructs, can burn
+                  on first open, and wrong guesses get locked out.
                 </p>
               </Reveal>
 
@@ -315,7 +452,7 @@ export default function App() {
                   <div className="flex items-center">
                     <span className="z-10 flex shrink-0 items-center gap-2 border-r border-line bg-moss px-4 py-2.5 font-mono text-[10px] font-bold tracking-[0.2em] text-gold">
                       <span className="h-1.5 w-1.5 animate-glowpulse rounded-full bg-gold" />
-                      VAULT FEED
+                      YOUR DROPS
                     </span>
                     <div className="relative flex-1 overflow-hidden">
                       {tickerItems.length === 0 ? (
@@ -376,6 +513,9 @@ export default function App() {
               onError={(m) => toast("error", m)}
               sealed={sealed}
               onDismissReceipt={() => setSealed(null)}
+              inboxTarget={inboxTarget}
+              onCancelInbox={() => setInboxTarget(null)}
+              shared={shared}
             />
           </Reveal>
         </section>
@@ -412,7 +552,7 @@ export default function App() {
                 n: "01",
                 icon: <IconLock width={22} height={22} />,
                 title: "Seal it",
-                body: "Paste a note, a link, or drop in a whole batch of files — up to 50 GB each. PinDrop mints a random 6-digit PIN, relays the files anonymously, and publishes the drop to a public cloud vault under that PIN. Add a self-destruct timer or burn-after-reading if it's spicy.",
+                body: "Paste a note, a link, or drop in a whole batch of files. PinDrop mints a random 6-digit PIN, uploads the files, and publishes the drop to the cloud vault under that PIN. Pick a fuse (1 hour to 7 days) and how many opens it allows — one means it burns on first read.",
                 offset: "lg:pl-0",
               },
               {
@@ -457,7 +597,7 @@ export default function App() {
               {
                 icon: <IconZap width={18} height={18} />,
                 t: "Fast by design",
-                b: "No accounts, no upload forms, no waiting rooms. The page is a few kilobytes of static shell — it renders before you blink, and the vault fetch is a single key lookup.",
+                b: "No accounts, no sign-up forms, no waiting rooms. Opening a drop is one lookup against the vault.",
               },
               {
                 icon: <IconCloud width={18} height={18} />,
@@ -467,7 +607,7 @@ export default function App() {
               {
                 icon: <IconFlame width={18} height={18} />,
                 t: "Fuses & burns",
-                b: "Timed self-destruct deletes the cloud key on schedule; burn-after-reading shreds it the moment the first person opens it. Secrets don't linger.",
+                b: "Every drop has a fuse, and an open limit if you want one. Both are enforced by the vault itself, so skipping this page doesn't keep a burned drop alive.",
               },
             ].map((c, i) => (
               <Reveal key={c.t} delay={i * 110} as="article">
@@ -495,10 +635,11 @@ export default function App() {
               </span>
             </div>
             <p className="mt-3 max-w-[60ch] font-mono text-[10px] leading-relaxed tracking-[0.06em] text-fern">
-              HOW THE MAGIC WORKS: DROPS LIVE IN PINDROP'S OWN PUBLIC STORE UNDER YOUR 6-DIGIT PIN — READABLE BY
-              ANYONE WHO KNOWS IT. FILES RELAY THROUGH TMPFILES.ORG / LITTERBOX / GOFILE (UP TO 50 GB EACH,
-              HELD ANYWHERE FROM 48H TO ~10 DAYS DEPENDING ON THE RELAY). DON'T DROP STATE SECRETS —
-              THE PIN IS THE ONLY LOCK.
+              HOW IT WORKS, HONESTLY: DROPS LIVE IN PINDROP'S STORE UNDER YOUR 6-DIGIT PIN — READABLE BY ANYONE
+              WHO KNOWS IT, AND NOT ENCRYPTED. WRONG GUESSES ARE LOCKED OUT PER NETWORK AND EVERY DROP EXPIRES
+              WITHIN 7 DAYS, BUT SIX DIGITS IS STILL ONLY A MILLION COMBINATIONS. FILES GO TO PINDROP STORAGE
+              WHEN CONFIGURED, OTHERWISE TO FREE RELAYS (TMPFILES / LITTERBOX / GOFILE) THAT CAN SEE THEM.
+              DON'T DROP REAL SECRETS — THE PIN IS THE ONLY LOCK.
             </p>
           </div>
           <a
@@ -511,6 +652,7 @@ export default function App() {
         </div>
       </footer>
 
+      {locked && <UnlockModal pin={locked.pin} onUnlock={handleUnlock} onClose={() => setLocked(null)} />}
       {opened && (
         <OpenedModal drop={opened.drop} burned={opened.burned} via={opened.via} onClose={() => setOpened(null)} />
       )}

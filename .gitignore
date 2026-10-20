@@ -5,7 +5,7 @@ build/
 
 # build artefacts
 .deploy/
-.vault.test.mjs
+.test-build/
 pinDrop-102.zip
 
 # local env

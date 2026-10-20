@@ -13,6 +13,7 @@ import {
 import { CopyButton } from "./ui";
 import {
   IconCloud,
+  IconDownload,
   IconEye,
   IconEyeOff,
   IconFile,
@@ -35,6 +36,8 @@ const typeIcon = (t: Drop["type"]) =>
     <IconNote width={18} height={18} />
   ) : t === "link" ? (
     <IconLink width={18} height={18} />
+  ) : t === "inbox" ? (
+    <IconDownload width={18} height={18} />
   ) : (
     <IconFile width={18} height={18} />
   );
@@ -61,6 +64,8 @@ function DropCard({
       ? `${(drop.payload.text || "").length.toLocaleString()} chars`
       : drop.type === "link"
       ? (drop.payload.link || "").replace(/^https?:\/\//, "").slice(0, 42)
+      : drop.type === "inbox"
+      ? "waiting for a delivery"
       : files.length
       ? `${files.length} file${files.length === 1 ? "" : "s"} · ${formatBytes(totalBytes(files))}`
       : "file";
@@ -76,7 +81,7 @@ function DropCard({
             className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
               drop.type === "note"
                 ? "bg-gold/12 text-gold"
-                : drop.type === "link"
+                : drop.type === "link" || drop.type === "inbox"
                 ? "bg-mint/12 text-mint"
                 : "bg-ember/12 text-ember"
             }`}
@@ -153,7 +158,7 @@ function DropCard({
         </button>
         <CopyButton text={buildShareLink(drop)} className="btn-chip" label="SHARE LINK" />
         <span className="ml-auto flex items-center gap-2">
-          <span className="font-mono text-[10px] tracking-wider text-fern">{drop.opens} OPEN{drop.opens === 1 ? "" : "S"}</span>
+          <span className="font-mono text-[10px] tracking-wider text-fern">{drop.opens}{drop.maxOpens ? `/${drop.maxOpens}` : ""} OPEN{drop.opens === 1 && !drop.maxOpens ? "" : "S"}</span>
           {confirm ? (
             <Fragment>
               <button

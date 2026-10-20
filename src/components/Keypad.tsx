@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { OpenVerdict } from "../lib/vault";
 import { IconBackspace, IconUnlock } from "./icons";
 
-type Status = "idle" | "typing" | "checking" | "found" | "unknown" | "expired" | "offline";
+type Status = "idle" | "typing" | "checking" | "found" | "unknown" | "expired" | "limited" | "inbox" | "filled" | "locked" | "offline";
 
 const STATUS_LINE: Record<Status, { text: string; cls: string }> = {
   idle: { text: "AWAITING 6-DIGIT PIN", cls: "text-sage" },
@@ -12,6 +12,10 @@ const STATUS_LINE: Record<Status, { text: string; cls: string }> = {
   unknown: { text: "UNKNOWN PIN — TRY AGAIN", cls: "text-ember" },
   expired: { text: "THAT DROP HAS EXPIRED", cls: "text-gold" },
   offline: { text: "CAN'T REACH THE CLOUD VAULT", cls: "text-ember" },
+  limited: { text: "TOO MANY WRONG PINS — WAIT 10 MIN", cls: "text-ember" },
+  inbox: { text: "INBOX FOUND — SEAL BELOW TO SEND INTO IT", cls: "text-mint" },
+  filled: { text: "THAT INBOX ALREADY GOT ITS DELIVERY", cls: "text-gold" },
+  locked: { text: "PASSWORD-LOCKED — ENTER THE PASSWORD", cls: "text-gold" },
 };
 
 const KEYS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "", "0", "⌫"];

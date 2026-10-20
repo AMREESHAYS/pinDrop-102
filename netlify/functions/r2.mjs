@@ -12,7 +12,7 @@ import { AwsClient } from "aws4fetch";
 const MAX_SIZE = 50 * 1024 * 1024 * 1024; // 50 GB
 const MIN_PART = 8 * 1024 * 1024; // S3 floor is 5 MB; 8 keeps part counts sane
 const MAX_PARTS = 9000; // S3 allows 10000 — leave headroom
-const KEY_RE = /^drops\/[a-z0-9]{16}\/[^/\\]{1,200}$/;
+export const KEY_RE = /^drops\/[a-z0-9]{16}\/[^/\\]{1,200}$/;
 
 const env = () => ({
   account: process.env.R2_ACCOUNT_ID,
@@ -42,6 +42,18 @@ const base = () => {
   const { account, bucket, endpoint } = env();
   const host = endpoint || `https://${account}.r2.cloudflarestorage.com`;
   return `${host.replace(/\/+$/, "")}/${bucket}`;
+};
+
+/** Objects are deleted only by the vault, after it has checked the owner token. */
+export async function deleteR2Object(key) {
+  if (!configured() || !KEY_RE.test(key || "")) return;
+  await client().fetch(`${base()}/${encodeURI(key)}`, { method: "DELETE" });
+}
+
+// Uploads are anonymous by design; this caps how fast one IP can push. A 50 GB
+// file signs in ~64 batches, so 120 a minute leaves room for retries.
+export const config = {
+  rateLimit: { windowLimit: 120, windowSize: 60, aggregateBy: ["ip", "domain"] },
 };
 
 const json = (body, status = 200) =>
@@ -166,14 +178,6 @@ export default async (req) => {
       { method: "DELETE" }
     );
     return json({ ok: true });
-  }
-
-  if (action === "delete") {
-    if (req.method !== "POST") return json({ error: "method" }, 405);
-    const { key } = await req.json();
-    if (!KEY_RE.test(key || "")) return json({ error: "key" }, 400);
-    const res = await aws.fetch(`${base()}/${encodeURI(key)}`, { method: "DELETE" });
-    return json({ ok: res.ok || res.status === 404 });
   }
 
   if (action === "get") {
